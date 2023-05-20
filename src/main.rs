@@ -52,6 +52,75 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .expect("No default surface config");
     surface.configure(&device, &config);
 
+    #[rustfmt::skip]
+    let vertices: Vec<f32> = vec![
+        // X,   Y
+        -0.8, -0.8, // Triangle 1
+         0.8, -0.8,
+         0.8,  0.8,
+        -0.8, -0.8, // Triangle 2
+         0.8,  0.8,
+        -0.8,  0.8,
+    ];
+
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Cell vertices"),
+        size: (vertices.len() * std::mem::size_of::<f32>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false, // WebGPU defaults to false `boolean mappedAtCreation = false;`
+    });
+
+    queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+    let vertex_buffer_layout = wgpu::VertexBufferLayout {
+        array_stride: 8,
+        step_mode: wgpu::VertexStepMode::Vertex, // WebGPU defaults to `GPUVertexStepMode stepMode = "vertex";`
+        attributes: &[wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: 0,
+            shader_location: 0,
+        }],
+    };
+
+    let cell_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Cell shader"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+            "
+            @vertex
+            fn vertexMain(@location(0) pos: vec2f) -> @builtin(position) vec4f {
+                return vec4f(pos, 0.0, 1.0);
+            }
+
+            @fragment
+            fn fragmentMain() -> @location(0) vec4f {
+                return vec4f(1.0, 0.0, 0.0, 1.0);
+            }
+        ",
+        )),
+    });
+
+    let swapchain_capabilities = surface.get_capabilities(&adapter);
+    let swapchain_format = swapchain_capabilities.formats[0];
+
+    let cell_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Cell pipeline"),
+        vertex: wgpu::VertexState {
+            module: &cell_shader_module,
+            entry_point: "vertexMain",
+            buffers: &[vertex_buffer_layout],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &cell_shader_module,
+            entry_point: "fragmentMain",
+            targets: &[Some(swapchain_format.into())],
+        }),
+        layout: None,
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
     // ```js
     // const encoder = device.createCommandEncoder();
     // ```
@@ -73,7 +142,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let view = frame
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
-    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: None,
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: &view,
@@ -90,6 +159,10 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         })],
         depth_stencil_attachment: None,
     });
+
+    pass.set_pipeline(&cell_pipeline);
+    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+    pass.draw(0..6, 0..1); // 6 vertices
 
     // ```js
     // pass.end()
