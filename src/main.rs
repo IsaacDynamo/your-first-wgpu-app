@@ -4,6 +4,12 @@ use winit::{
     window::Window,
 };
 
+const GRID_SIZE: usize = 32;
+
+fn byte_length<T>(vec: &Vec<T>) -> u64 {
+    (vec.len() * std::mem::size_of::<T>()) as u64
+}
+
 async fn run(event_loop: EventLoop<()>, window: Window) {
     let instance = wgpu::Instance::default();
 
@@ -52,6 +58,16 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .expect("No default surface config");
     surface.configure(&device, &config);
 
+    let uniform_array = vec![GRID_SIZE as f32, GRID_SIZE as f32];
+    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Grid Uniforms"),
+        size: byte_length(&uniform_array),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false, // WebGPU defaults to false `boolean mappedAtCreation = false;`
+    });
+
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&uniform_array));
+
     #[rustfmt::skip]
     let vertices: Vec<f32> = vec![
         // X,   Y
@@ -65,7 +81,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Cell vertices"),
-        size: (vertices.len() * std::mem::size_of::<f32>()) as u64,
+        size: byte_length(&vertices),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false, // WebGPU defaults to false `boolean mappedAtCreation = false;`
     });
@@ -86,9 +102,17 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         label: Some("Cell shader"),
         source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
             "
+            @group(0) @binding(0) var<uniform> grid: vec2f;
+
             @vertex
-            fn vertexMain(@location(0) pos: vec2f) -> @builtin(position) vec4f {
-                return vec4f(pos, 0.0, 1.0);
+            fn vertexMain(@location(0) pos: vec2f, @builtin(instance_index) instance: u32) -> @builtin(position) vec4f {
+
+                let i = f32(instance);
+                let cell = vec2f(i % grid.x, floor(i / grid.x));
+                let cell_offset = cell / grid * 2.0;
+                let grid_pos = (pos + 1.0) / grid - 1.0 + cell_offset;
+
+                return vec4f(grid_pos, 0.0, 1.0);
             }
 
             @fragment
@@ -119,6 +143,15 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Cell renderer bind group"),
+        layout: &cell_pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(uniform_buffer.as_entire_buffer_binding()),
+        }],
     });
 
     // ```js
@@ -162,7 +195,10 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
 
     pass.set_pipeline(&cell_pipeline);
     pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-    pass.draw(0..6, 0..1); // 6 vertices
+    pass.set_bind_group(0, &bind_group, &[]);
+    let vs = (vertices.len() / 2) as u32;
+    let is: u32 = (GRID_SIZE * GRID_SIZE) as u32;
+    pass.draw(0..vs, 0..is);
 
     // ```js
     // pass.end()
