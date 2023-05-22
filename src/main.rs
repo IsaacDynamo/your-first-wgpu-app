@@ -1,5 +1,7 @@
+use std::time::{Duration, Instant};
+
 use winit::{
-    event::{Event, WindowEvent},
+    event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::Window,
 };
@@ -98,6 +100,45 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         }],
     };
 
+    // Create an array representing the active state of each cell.
+    let mut cell_state_array = vec![0u32; GRID_SIZE * GRID_SIZE];
+
+    // Create two storage buffers to hold the cell state.
+    let cell_state_storage = [
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cell State A"),
+            size: byte_length(&cell_state_array),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false, // WebGPU defaults to false `boolean mappedAtCreation = false;`
+        }),
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cell State B"),
+            size: byte_length(&cell_state_array),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false, // WebGPU defaults to false `boolean mappedAtCreation = false;`
+        }),
+    ];
+
+    // Mark every third cell of the grid as active.
+    for (i, cell) in cell_state_array.iter_mut().enumerate() {
+        *cell = (i % 3 == 0) as u32;
+    }
+    queue.write_buffer(
+        &cell_state_storage[0],
+        0,
+        bytemuck::cast_slice(&cell_state_array),
+    );
+
+    // Mark every other cell of the second grid as active.
+    for (i, cell) in cell_state_array.iter_mut().enumerate() {
+        *cell = (i % 2 == 0) as u32;
+    }
+    queue.write_buffer(
+        &cell_state_storage[1],
+        0,
+        bytemuck::cast_slice(&cell_state_array),
+    );
+
     let cell_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Cell shader"),
         source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
@@ -113,14 +154,17 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
             };
 
             @group(0) @binding(0) var<uniform> grid: vec2f;
+            @group(0) @binding(1) var<storage> cell_state: array<u32>; 
 
             @vertex
             fn vertexMain(input: VertexInput) -> VertexOutput {
 
                 let i = f32(input.instance);
                 let cell = vec2f(i % grid.x, floor(i / grid.x));
+                let state = f32(cell_state[input.instance]);
+
                 let cell_offset = cell / grid * 2.0;
-                let grid_pos = (input.pos + 1.0) / grid - 1.0 + cell_offset;
+                let grid_pos = (input.pos * state + 1.0) / grid - 1.0 + cell_offset;
 
                 var output: VertexOutput;
                 output.pos = vec4f(grid_pos, 0.0, 1.0);
@@ -159,82 +203,124 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         multiview: None,
     });
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Cell renderer bind group"),
-        layout: &cell_pipeline.get_bind_group_layout(0),
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(uniform_buffer.as_entire_buffer_binding()),
-        }],
-    });
+    let bind_group = [
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Cell renderer bind group A"),
+            layout: &cell_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        uniform_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        cell_state_storage[0].as_entire_buffer_binding(),
+                    ),
+                },
+            ],
+        }),
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Cell renderer bind group B"),
+            layout: &cell_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        uniform_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        cell_state_storage[1].as_entire_buffer_binding(),
+                    ),
+                },
+            ],
+        }),
+    ];
 
-    // ```js
-    // const encoder = device.createCommandEncoder();
-    // ```
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-    // ```js
-    // const pass = encoder.beginRenderPass({
-    //     colorAttachments: [{
-    //         view: context.getCurrentTexture().createView(),
-    //         loadOp: "clear",
-    //         clearValue: { r: 0, g: 0, b: 0.4, a: 1 }, // New line
-    //         storeOp: "store",
-    //     }],
-    // });
-    // ```
-    let frame = surface
-        .get_current_texture()
-        .expect("Current texture not found");
-    let view = frame
-        .texture
-        .create_view(&wgpu::TextureViewDescriptor::default());
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: None,
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.4,
-                    a: 1.0,
-                }),
-                store: true,
-            },
-        })],
-        depth_stencil_attachment: None,
-    });
-
-    pass.set_pipeline(&cell_pipeline);
-    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-    pass.set_bind_group(0, &bind_group, &[]);
-    let vs = (vertices.len() / 2) as u32;
-    let is: u32 = (GRID_SIZE * GRID_SIZE) as u32;
-    pass.draw(0..vs, 0..is);
-
-    // ```js
-    // pass.end()
-    // ```
-    drop(pass);
-
-    // ```js
-    // device.queue.submit([encoder.finish()]);
-    // ```
-    queue.submit(Some(encoder.finish()));
-
-    // Present the the work that has been submitted into the queue
-    frame.present();
+    const UPDATE_INTERVAL: Duration = Duration::new(0, 200_000_000);
+    let mut step = 0;
 
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.
         // `event_loop.run` never returns, therefore we must do this to ensure
         // the resources are properly cleaned up.
-        let _ = (&instance, &adapter);
+        let _ = (&instance, &adapter, &cell_shader_module);
 
-        *control_flow = ControlFlow::Wait;
         match event {
+            Event::NewEvents(StartCause::Init) => {
+                control_flow.set_wait_until(Instant::now() + UPDATE_INTERVAL);
+            }
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                control_flow.set_wait_until(Instant::now() + UPDATE_INTERVAL);
+
+                // Slow render loop
+                step = (step + 1) % 2;
+
+                // ```js
+                // const encoder = device.createCommandEncoder();
+                // ```
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+                // ```js
+                // const pass = encoder.beginRenderPass({
+                //     colorAttachments: [{
+                //         view: context.getCurrentTexture().createView(),
+                //         loadOp: "clear",
+                //         clearValue: { r: 0, g: 0, b: 0.4, a: 1 }, // New line
+                //         storeOp: "store",
+                //     }],
+                // });
+                // ```
+                let frame = surface
+                    .get_current_texture()
+                    .expect("Current texture not found");
+                let view = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.4,
+                                a: 1.0,
+                            }),
+                            store: true,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                });
+
+                pass.set_pipeline(&cell_pipeline);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_bind_group(0, &bind_group[step], &[]);
+                let vs = (vertices.len() / 2) as u32;
+                let is: u32 = (GRID_SIZE * GRID_SIZE) as u32;
+                pass.draw(0..vs, 0..is);
+
+                // ```js
+                // pass.end()
+                // ```
+                drop(pass);
+
+                // ```js
+                // device.queue.submit([encoder.finish()]);
+                // ```
+                queue.submit(Some(encoder.finish()));
+
+                // Present the the work that has been submitted into the queue
+                frame.present();
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
